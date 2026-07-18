@@ -13,7 +13,7 @@ ReViSQL reaches human parity through two procedures:
 
 2. **RLVR Training** — Fine-tuning with CISPO. We train two configurations:
    - **ReViSQL** (the recipe): RLVR on BIRD-Platinum with a result-based reward that grades a rollout by whether its execution result matches the verified gold. We fine-tune Qwen3-235B-A22B with this recipe (**ReViSQL-235B**).
-   - **ReViSQL-BIRD** (BIRD-specialized): adds two reward-shaping techniques to the result-based reward — a **VeriEQL** formal-equivalence check that softly down-weights rollouts whose results match by coincidence but are not provably equivalent to the gold, and an **evidence-supervision** reward that requires the model to translate and verify each external-knowledge entry. We fine-tune Kimi-K2.6 with this variant (**ReViSQL-BIRD-K2.6**), the model that reaches human parity. No process reward model (PRM) is used.
+   - **ReViSQL-BIRD** (BIRD-specialized): adds two reward-shaping techniques to the result-based reward — a **VeriEQL** formal-equivalence check that softly down-weights rollouts whose results match by coincidence but are not provably equivalent to the gold, and an **evidence-supervision** reward that requires the model to translate and verify each external-knowledge entry. We fine-tune Kimi-K2.6 with this variant (**ReViSQL-BIRD-K2.6**), the model that reaches human parity.
 
 
 ## Repository Structure
@@ -155,7 +155,6 @@ Training configuration (matching the paper):
 | Algorithm | CISPO |
 | VeriEQL reward (ReViSQL-BIRD) | enabled; soft 1 − β = 0.8 on non-equivalence (β = 0.2) |
 | Evidence supervision (ReViSQL-BIRD) | enabled (prompt + penalty λ = 0.1) |
-| Process reward (PRM) | none |
 
 The training checkpoint with the highest validation accuracy on `data/val_test.parquet` is selected for inference.
 
