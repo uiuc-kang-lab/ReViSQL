@@ -63,6 +63,7 @@ def convert_data(data: pd.DataFrame):
             ],
             'env_class': 'text2sql',
             'db_id': d['db_id'],
+            'external_knowledge': d['evidence'],
             'data': 'bird-verified',
             'reward_spec': {
                 'ground_truth': d['SQL'],

@@ -21,6 +21,8 @@ from tinker_cookbook.recipes.sql_rl.grader import grade
 from tinker_cookbook import renderers
 from tinker_cookbook.rl.problem_env import ProblemGroupBuilder
 from tinker_cookbook.recipes.sql_rl.prompts import system_prompt, SQL_TOOLS
+from tinker_cookbook.recipes.sql_rl.prompts_evidence_supervision import bird_system_prompt as system_prompt_evidence_supervision_bird
+from tinker_cookbook.recipes.sql_rl.verieql_grader import grade_with_verieql
 from datasets import load_dataset, Dataset, concatenate_datasets
 from typing import Literal, cast, Tuple, Any
 from functools import partial
@@ -108,14 +110,16 @@ def convert_content_to_dict(content: str | list[ContentPart]) -> dict[str, Any]:
         raise ValueError("Content must be a string or a list of ContentPart")
 
 class SQLEnv(Env):
-    def __init__(self, question_id: str, question: str, gold_answer: int, grading_method: str, renderer: Renderer, db_file, timeout, db_modification_script: str | None, dump_path: str | None = None, use_convo_prefix: bool = True, max_output_tokens_per_turn: int = 3072,
+    def __init__(self, question_id: str, question: str, external_knowledge: str | None, gold_answer: int, grading_method: str, renderer: Renderer, db_file, timeout, db_modification_script: str | None, dump_path: str | None = None, use_convo_prefix: bool = True, max_output_tokens_per_turn: int = 3072,
     max_input_tokens: int = 32768, model_name: str = "qwen", max_turns: int = 5,
-    sql_engine: str = "SQLite"):
-        
+    sql_engine: str = "SQLite", use_verieql: bool = False,
+    use_evidence_supervision_prompt: bool = False, use_evidence_supervision_penalty: bool = False):
+
         assert sql_engine in ("SQLite", "Snowflake"), "Only SQLite and Snowflake are supported currently"
-        
+
         self.renderer: Renderer = renderer
         self.turns: list[Message] = []
+        self.external_knowledge = external_knowledge
         self.gold_answer: int = gold_answer
         self.db_file = db_file
         self.timeout = timeout
@@ -130,6 +134,22 @@ class SQLEnv(Env):
         self.max_input_tokens = max_input_tokens
         self.model_name = model_name
         self.sql_engine = sql_engine
+        self.use_verieql = use_verieql
+        self.use_evidence_supervision_prompt = use_evidence_supervision_prompt
+        self.use_evidence_supervision_penalty = use_evidence_supervision_penalty
+        # Track whether each evidence-supervision penalty fired during the episode.
+        # Surfaced in StepResult.metrics on the terminal step so batch means give per-episode rates.
+        self._requirement_penalty_applied: bool = False
+        self._verification_penalty_applied: bool = False
+
+        # Count non-empty external-knowledge pieces (separated by ';') for the
+        # evidence-supervision requirement/verification checks.
+        external_knowledge_list = external_knowledge.split(";") if external_knowledge is not None else []
+        self.n_effective_knowledge = 0
+        for knowledge in external_knowledge_list:
+            if knowledge.strip().strip(";") == '':
+                continue
+            self.n_effective_knowledge += 1
 
         if "Qwen3" in self.model_name:
             one_shot_prompt = qwen_one_shot_prompt
@@ -137,9 +157,12 @@ class SQLEnv(Env):
             one_shot_prompt = kimi_one_shot_prompt
         else:
             one_shot_prompt = general_one_shot_prompt
-        
+
         one_shot_prompt[0]['content'] = one_shot_prompt[0]['content'].format(engine=self.sql_engine)
-        self.system_prompt = system_prompt.format(engine=self.sql_engine)
+        if self.use_evidence_supervision_prompt:
+            self.system_prompt = system_prompt_evidence_supervision_bird.format(engine=self.sql_engine)
+        else:
+            self.system_prompt = system_prompt.format(engine=self.sql_engine)
         self.convo_prefix = one_shot_prompt
         
         if self.sql_engine == "Snowflake":
@@ -204,7 +227,59 @@ class SQLEnv(Env):
                     return part["text"]
         return ""
 
-    async def _get_user_turn(self, action_text: str, tool_calls: List[ToolCall] = []) -> tuple[List[Message]|None, float]:
+    def _get_all_text_part(self, content: str | list[ContentPart]) -> str:
+        if isinstance(content, str):
+            return content
+        elif isinstance(content, list):
+            texts = []
+            for part in content:
+                if part["type"] == "text":
+                    texts.append(part["text"])
+            return "\n".join(texts)
+        return ""
+
+    _REQUIREMENT_RE = re.compile(r"Requirement of external knowledge\s+\d+\s*\(", re.IGNORECASE)
+    _VERIFICATION_RE = re.compile(r"Verification of external knowledge\s+\d+\s*\(", re.IGNORECASE)
+
+    def _has_evidence_supervision(self, n_knowledge: int, message_text: str, mode: str) -> bool:
+        if mode == "check":
+            return len(self._REQUIREMENT_RE.findall(message_text)) >= n_knowledge
+        elif mode == "verify":
+            return len(self._VERIFICATION_RE.findall(message_text)) >= n_knowledge
+        else:
+            raise ValueError("Mode must be either 'check' or 'verify'")
+
+    def _check_missing_requirement(self) -> bool:
+        """True if no assistant turn so far contains the enumerated requirement block."""
+        if self.n_effective_knowledge == 0:
+            return False
+        for turn in self.turns:
+            if turn["role"] == "assistant":
+                message_text = self._get_all_text_part(turn["content"])
+                if self._has_evidence_supervision(self.n_effective_knowledge, message_text, mode="check"):
+                    return False
+        return True
+
+    def _check_missing_verification(self) -> bool:
+        """True if the final assistant message lacks the enumerated verification block."""
+        if self.n_effective_knowledge == 0:
+            return False
+        # find the last assistant message
+        last_message = None
+        for turn in reversed(self.turns):
+            if turn["role"] == "assistant":
+                last_message = turn
+                break
+        if last_message is None:
+            return False
+        message_text = self._get_all_text_part(last_message["content"])
+        return not self._has_evidence_supervision(self.n_effective_knowledge, message_text, mode="verify")
+
+    async def _get_user_turn(self, action_text: str, tool_calls: List[ToolCall] = []) -> tuple[List[Message]|None, float, float]:
+        # Returns (user_turn_messages_or_None, outcome_reward, prm_reward).
+        # prm_reward is the reward attributed to a non-terminal step; it is always 0.0
+        # here (no process reward model) but is kept so the evidence-supervision penalty
+        # can dock an intermediate step in step().
         # check if there is a solution
         if not action_text.endswith('</solution>'):
             # this means this turn is an intermediate step involving tool calls
@@ -251,12 +326,12 @@ class SQLEnv(Env):
 
             if len(messages) == 0:
                 messages.append(Message(role="user", content="Your previous action is invalid. Follow the format of outputting a sql tool call or a final solution."))
-            return messages, 0.0
+            return messages, 0.0, 0.0
         else:
             is_valid, _, pred_sql, _ = verify_format_and_extract(action_text)
 
             if not is_valid:
-                return [Message(role="user", content="Your previous action is invalid. Follow the format of outputting thinking process and sql tool, and try again.")], -1.0
+                return [Message(role="user", content="Your previous action is invalid. Follow the format of outputting thinking process and sql tool, and try again.")], -1.0, 0.0
 
             # if self.dump_path is not None:
             #     with open(os.path.join(self.dump_path, f"{self.question_id}_pred.sql"), "w") as f:
@@ -265,11 +340,11 @@ class SQLEnv(Env):
 
             if self.sql_engine == "Snowflake":
                 wandb.termlog(f"Prediction for Snowflake Problem {self.question_id}: {pred_sql}")
-                return None, 0.0  # skip grading for snowflake for now
+                return None, 0.0, 0.0  # skip grading for snowflake for now
             elif "local" in self.question_id:
                 wandb.termlog(f"Prediction for Spider2SQLite Problem {self.question_id}: {pred_sql}")
-                return None, 0.0
-            
+                return None, 0.0, 0.0
+
             pred = await execute_sql_wrapper_single(self.db_file, pred_sql, self.timeout)
             ref = await execute_sql_wrapper_single(self.db_file, self.gold_answer, self.timeout)
 
@@ -278,17 +353,28 @@ class SQLEnv(Env):
 
             if pred_results is None:
                 wandb.termlog(f"Fail to execute the prediction for Problem {self.question_id}: {pred_sql}")
-                return None, 0.0
+                return None, 0.0, 0.0
             elif gt_results is None:
                 wandb.termlog(f"Fail to execute the groundtruth for Problem {self.question_id}: {self.gold_answer}")
-                return None, 0.0
+                return None, 0.0, 0.0
             else:
                 if grade(gt_results, pred_results, self.grading_method)[0]:
+                    # Execution grading says correct; check formal equivalence with VeriEQL.
+                    # VeriEQL rejection gives a soft reward (0.8) to hedge against false negatives.
+                    if self.use_verieql and self.sql_engine == "SQLite":
+                        verieql_result = await grade_with_verieql(
+                            self.db_file, pred_sql, self.gold_answer, timeout=30.0
+                        )
+                        if verieql_result is False:
+                            wandb.termlog(
+                                f"[VeriEQL] non-equivalent prediction for Problem {self.question_id}: {pred_sql}"
+                            )
+                            return None, 0.8, 0.0
                     wandb.termlog(f"Correct prediction for Problem {self.question_id}: {pred_sql}")
-                    return None, 1.0
+                    return None, 1.0, 0.0
                 else:
                     wandb.termlog(f"Wrong prediction for Problem {self.question_id}: {pred_sql}")
-                    return None, 0.0
+                    return None, 0.0, 0.0
 
 
     def _is_done(self, action: str) -> bool:
@@ -311,7 +397,7 @@ class SQLEnv(Env):
         })
 
         # step 2: based on the string answer, we compute the reward and the user turn.
-        user_turn, reward = await self._get_user_turn(
+        user_turn, reward, prm_reward = await self._get_user_turn(
             self._get_last_text_part(action_message["content"]),
             action_message["tool_calls"] if "tool_calls" in action_message else []
         )
@@ -345,24 +431,53 @@ class SQLEnv(Env):
                 "role": "system",
                 "content": f"Episode done with reward: {reward}"
             })
-        episode_done = self._is_done(self._get_last_text_part(action_message['content']))
+        # Determine episode termination: natural end via _is_done, or forced end via context overflow.
+        last_action_text = self._get_last_text_part(action_message['content'])
+        emitted_solution = "<solution>" in last_action_text and "</solution>" in last_action_text
+        episode_done = self._is_done(last_action_text)
 
         if self._obs.length + self.max_output_tokens_per_turn > self.max_input_tokens:
             episode_done = True
             print("Observation too long, marking episode as done.")
             print(f"Observation length: {self._obs.length}, max input tokens: {self.max_input_tokens}, max output tokens per turn: {self.max_output_tokens_per_turn}")
             print(self.traces)
-        
-        # if episode_done:
-        #     print(f"Reward: {reward}")
-        #     print("=" * 100)
+
+        # Evidence-supervision penalty runs with the authoritative episode_done (post-overflow)
+        # and uses emitted_solution to gate checks that only make sense at solution time.
+        if self.use_evidence_supervision_penalty:
+            if emitted_solution and self.num_turn == 1:
+                # Easy-question soft rule: a one-turn solution only needs one of the two blocks.
+                if self._check_missing_requirement() and self._check_missing_verification():
+                    reward -= 0.1
+                    self._requirement_penalty_applied = True
+                    self._verification_penalty_applied = True
+            elif self.num_turn == 2 and self._check_missing_requirement():
+                # Requirement translation must appear by turn 2; fires once per episode.
+                if episode_done:
+                    reward -= 0.1
+                else:
+                    prm_reward -= 0.1
+                self._requirement_penalty_applied = True
+            # Verification only applies when the model actually commits a solution.
+            if emitted_solution and self.num_turn > 1 and self._check_missing_verification():
+                reward -= 0.1
+                self._verification_penalty_applied = True
 
         # step 4: return the step result
+        step_metrics: dict[str, float | int] = {}
+        if episode_done and self.use_evidence_supervision_penalty and self.n_effective_knowledge > 0:
+            step_metrics["evidence_supervision/requirement_penalty"] = float(self._requirement_penalty_applied)
+            step_metrics["evidence_supervision/verification_penalty"] = float(self._verification_penalty_applied)
+            step_metrics["evidence_supervision/any_penalty"] = float(
+                self._requirement_penalty_applied or self._verification_penalty_applied
+            )
+
         step_result = StepResult(
             next_observation=self._obs,
             next_stop_condition=self.stop_condition,
             episode_done=episode_done,
-            reward= 0 if not episode_done else reward
+            reward=reward if episode_done else prm_reward,
+            metrics=step_metrics,
         )
 
         return step_result
@@ -386,7 +501,10 @@ class BIRDDataset(RLDataset):
         max_input_tokens: int = 32768,
         max_turns: int = 5,
         dump_path: str | None = None,
-        sql_engine: str = "SQLite"
+        sql_engine: str = "SQLite",
+        use_verieql: bool = False,
+        use_evidence_supervision_prompt: bool = False,
+        use_evidence_supervision_penalty: bool = False,
     ):
         if split not in ("train", "test"):
             raise ValueError("split must be 'train' or 'test'")
@@ -449,6 +567,10 @@ class BIRDDataset(RLDataset):
         self.model_name = model_name
         self.max_turns = max_turns
         self.sql_engine = sql_engine
+        # VeriEQL is a training-only reward shaping; never applied on the test split.
+        self.use_verieql = use_verieql if split != "test" else False
+        self.use_evidence_supervision_prompt = use_evidence_supervision_prompt
+        self.use_evidence_supervision_penalty = use_evidence_supervision_penalty
 
     @classmethod
     def question_suffix(cls) -> str:
@@ -477,6 +599,7 @@ class BIRDDataset(RLDataset):
         # Extract problem and answer from the dataset
         problem_id = f"{x['data_source']}_{x['question_id']}"
         problem = x["prompt"][1]["content"]
+        external_knowledge = x.get("external_knowledge", None)
         answer = x["reward_spec"]["ground_truth"]
         grading_method = x["reward_spec"].get("grading_method", "multiset")
         dataset_name = x["data_source"]
@@ -495,7 +618,10 @@ class BIRDDataset(RLDataset):
             return None
         return ProblemGroupBuilder(
             env_thunk=partial(
-                SQLEnv, problem_id, problem, answer, grading_method, self.renderer, db_file, self.timeout, db_modification_script, self.dump_path, self.use_convo_prefix, self.max_output_tokens_per_turn, self.max_input_tokens, self.model_name, self.max_turns, self.sql_engine
+                SQLEnv, problem_id, problem, external_knowledge, answer, grading_method, self.renderer, db_file, self.timeout, db_modification_script, self.dump_path, self.use_convo_prefix, self.max_output_tokens_per_turn, self.max_input_tokens, self.model_name, self.max_turns, self.sql_engine,
+                use_verieql=self.use_verieql,
+                use_evidence_supervision_prompt=self.use_evidence_supervision_prompt,
+                use_evidence_supervision_penalty=self.use_evidence_supervision_penalty,
             ),
             num_envs=group_size,
             dataset_name=dataset_name,
@@ -523,6 +649,9 @@ class BIRDDatasetBuilder(RLDatasetBuilder):
     max_turns: int = 5
     curriculum_learning: bool = False
     sql_engine: str = "SQLite"
+    use_verieql: bool = False
+    use_evidence_supervision_prompt: bool = False
+    use_evidence_supervision_penalty: bool = False
 
     async def __call__(self) -> tuple[RLDataset, RLDataset]:
         sql_renderer = get_renderer(self.renderer_name, get_tokenizer(self.model_name))
@@ -565,7 +694,10 @@ class BIRDDatasetBuilder(RLDatasetBuilder):
             max_input_tokens=self.max_input_tokens,
             max_turns=self.max_turns,
             model_name=self.model_name,
-            sql_engine=self.sql_engine
+            sql_engine=self.sql_engine,
+            use_verieql=self.use_verieql,
+            use_evidence_supervision_prompt=self.use_evidence_supervision_prompt,
+            use_evidence_supervision_penalty=self.use_evidence_supervision_penalty,
         )
         test_dataset = BIRDDataset(
             batch_size=self.batch_size,
@@ -582,6 +714,9 @@ class BIRDDatasetBuilder(RLDatasetBuilder):
             max_input_tokens=self.max_input_tokens,
             max_turns=self.max_turns,
             model_name=self.model_name,
-            sql_engine=self.sql_engine
+            sql_engine=self.sql_engine,
+            use_verieql=False,
+            use_evidence_supervision_prompt=self.use_evidence_supervision_prompt,
+            use_evidence_supervision_penalty=False,
         )
         return training_dataset, test_dataset

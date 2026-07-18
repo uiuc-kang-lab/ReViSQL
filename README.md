@@ -1,8 +1,8 @@
 # ReViSQL: Achieving Human-Level Text-to-SQL
 
-**VLDB 2026 Artifact**
+**SIGMOD 2027 Artifact**
 
-> ReViSQL is a streamlined framework that achieves human-level accuracy on BIRD for the first time. Instead of complex AI agents, ReViSQL leverages reinforcement learning with verifiable rewards (RLVR) on BIRD-Verified — a dataset of 2,462 expert-verified Text-to-SQL instances — and inference-time scaling via execution-based reconciliation and majority voting.
+> ReViSQL is a streamlined framework that achieves human-level accuracy on BIRD for the first time. Instead of complex AI agents, ReViSQL leverages reinforcement learning with verifiable rewards (RLVR) on BIRD-Verified — a dataset of 2,462 expert-verified Text-to-SQL instances — combining execution-correctness, VeriEQL formal-equivalence, and evidence-supervision rewards, with inference-time scaling via majority voting.
 
 
 ## Framework Overview
@@ -11,9 +11,9 @@ ReViSQL achieves human parity through three procedures:
 
 1. **BIRD-Verified** — Expert-curated training data. We corrected annotation errors across 52.1% of SQL queries, 26.2% of questions, and 18.2% of external knowledge contexts in 2,462 BIRD Train instances.
 
-2. **RLVR Training** — Fine-tuning with CISPO, a stable RLVR algorithm. The model generates multiple SQL rollouts per question; rollouts are rewarded based on execution correctness against the verified gold SQL.
+2. **RLVR Training** — Fine-tuning with CISPO, a stable RLVR algorithm. The model generates multiple SQL rollouts per question, rewarded by a combination of three verifiable signals: (a) **execution correctness** against the verified gold SQL; (b) a **VeriEQL** formal-equivalence check that softly down-weights rollouts whose results match by coincidence but are not provably equivalent to the gold query; and (c) an **evidence-supervision** reward that requires the model to translate and verify each piece of external knowledge. No process reward model (PRM) is used.
 
-3. **Inference-time Scaling with Reconciliation** — At inference, the fine-tuned model generates *N* candidate queries, which are grouped by execution result. A pre-RLVR base model (with broader linguistic knowledge) filters groups against the explicit question constraints. The surviving groups are resolved by majority voting.
+3. **Inference-time Scaling** — At inference, the fine-tuned model generates *N* candidate queries per question, and the final answer is selected by execution-based majority voting.
 
 
 ## Repository Structure
@@ -38,12 +38,6 @@ ReViSQL/
 │   ├── train.py                   # RLVR fine-tuning with CISPO (via Tinker)
 │   └── infer.py                   # Inference + evaluation with RLTestSetEvaluator
 │
-├── reconciliation/                # Inference-time reconciliation (Algorithm 1, §5.2)
-│   ├── reconciliation.py          # Core Decide() function: LLM-based constraint filtering
-│   ├── prompt.py                  # Reconciliation prompt templates
-│   ├── run_reconciliation.py      # Batch reconciliation on graded results
-│   └── run_reconciliation_detailed.py  # Detailed per-query reconciliation logging
-│
 ├── data_scripts/                  # Data preparation scripts
 │   ├── curate_final_data.py       # Main curation: produces bird-verified-train.parquet + val_test.parquet
 │   ├── curate_RL_dataset.py       # Earlier curation pipeline (intermediate artifacts)
@@ -67,14 +61,16 @@ ReViSQL/
 # Install ReViSQL and dependencies
 uv sync
 
-# Copy .env and fill in API keys (Together AI for inference, W&B for logging)
+# VeriEQL (formal SQL equivalence, used by the training reward) is an optional extra:
+uv sync --extra verieql
+
+# Copy .env and fill in API keys
 cp .env.example .env
 ```
 
 **Required environment variables** (in `.env`):
 ```
-TOGETHER_API_KEY=...      # For reconciliation LLM calls (Qwen3-235B via Together AI)
-GROQ_API_KEY=...          # Optional: alternative provider for reconciliation
+TINKER_API_KEY=...        # For model training/sampling via Tinker
 WANDB_API_KEY=...         # For training/eval logging
 ```
 
@@ -106,9 +102,11 @@ uv run data_scripts/curate_final_data.py
 
 Training uses RLVR with the CISPO algorithm via the bundled Tinker framework. The training script accepts CLI arguments using the `chz` configuration system.
 
+The three reward signals — execution correctness, VeriEQL formal equivalence, and evidence supervision — are enabled by default via the flags `use_verieql`, `use_evidence_supervision_prompt`, and `use_evidence_supervision_penalty` (all `True`). Set any of them to `False` for ablations. Because VeriEQL is enabled by default, launch training with the `--extra verieql` group so the VeriEQL solver is installed:
+
 **ReViSQL-30B-A3B (low-cost model):**
 ```bash
-uv run scripts/train.py \
+uv run --extra verieql scripts/train.py \
     model_name=Qwen/Qwen3-30B-A3B \
     train_data_path=data/bird-verified-train.parquet \
     test_data_path=data/val_test.parquet \
@@ -126,7 +124,7 @@ uv run scripts/train.py \
 
 **ReViSQL-235B-A22B (high-accuracy model):**
 ```bash
-uv run scripts/train.py \
+uv run --extra verieql scripts/train.py \
     model_name=Qwen/Qwen3-235B-A22B \
     train_data_path=data/bird-verified-train.parquet \
     test_data_path=data/val_test.parquet \
@@ -153,6 +151,9 @@ Key hyperparameters (matching §5.1):
 | Max output tokens/turn | 3,000 |
 | Train/val split | 85:15 |
 | Algorithm | CISPO |
+| VeriEQL reward | enabled (soft 0.8 on non-equivalence) |
+| Evidence supervision | enabled (prompt + penalty) |
+| Process reward (PRM) | none |
 
 The training checkpoint with the highest validation accuracy on `data/val_test.parquet` (Arcwise-Plat-Full + Arcwise-Plat-SQL split) is selected for inference, as described in §6.5 (Table 6).
 
@@ -160,7 +161,7 @@ The training checkpoint with the highest validation accuracy on `data/val_test.p
 
 ## Inference
 
-The inference script runs greedy decoding and/or temperature sampling to generate *N* SQL candidates per question, then passes them through reconciliation and majority voting (Algorithm 1, §5.2).
+The inference script runs greedy decoding and/or temperature sampling to generate *N* SQL candidates per question; the final answer is selected by execution-based majority voting.
 
 **Low-budget setting (5 candidates, greedy + 4 temperatures):**
 ```bash
@@ -190,25 +191,7 @@ uv run scripts/infer.py \
     repeat=129
 ```
 
-Inference-time reconciliation (the `Decide()` step in Algorithm 1) is performed by `reconciliation/reconciliation.py` using a pre-RLVR base model (Qwen3-235B via Together AI). Set `TOGETHER_API_KEY` in your `.env` before running.
-
----
-
-## Reconciliation Module
-
-The `reconciliation/` module implements the inference-time constraint filtering described in §5.2. It uses an LLM to judge whether a set of SQL candidates correctly covers the constraints in the question and external knowledge hint.
-
-**Standalone batch reconciliation** (for post-hoc analysis on graded results):
-```bash
-cd reconciliation
-uv run run_reconciliation.py \
-    --graded_result_path ../graded_results/my_run \
-    --output_path decisions.jsonl \
-    --data_file ../data/arcwise_plat_sql.json \
-    --model_name Qwen/Qwen3-235B-A22B-Instruct-2507-tput
-```
-
-The core function is `determine_one_generation_defensive()` in `reconciliation/reconciliation.py`, which corresponds to `Decide(M, x, G[j])` in Algorithm 1.
+Inference uses the same evidence-supervision system prompt as training (`use_evidence_supervision_prompt=True` by default). VeriEQL and the evidence-supervision penalty are training-only reward-shaping signals and are automatically disabled on the test split.
 
 ---
 

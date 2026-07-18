@@ -31,6 +31,8 @@ class CLIConfig:
     temperature: float = 1
     repeat: int = 1
     sql_engine: str = "SQLite"
+    # Use the evidence-supervision system prompt at inference to match training.
+    use_evidence_supervision_prompt: bool = True
 
 
 async def build_config(cli_config: CLIConfig) -> tuple[RLTestSetEvaluator, tinker.SamplingClient]:
@@ -56,6 +58,7 @@ async def build_config(cli_config: CLIConfig) -> tuple[RLTestSetEvaluator, tinke
         max_turns=cli_config.max_turns,
         max_output_tokens_per_turn=cli_config.max_output_tokens_per_turn,
         sql_engine=cli_config.sql_engine,
+        use_evidence_supervision_prompt=cli_config.use_evidence_supervision_prompt,
     )
 
     print("Creating service client...")

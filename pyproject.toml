@@ -16,12 +16,11 @@ dependencies = [
     "sqlglot[rs]>=28.6.0",
     "duckdb>=1.0.0",
     # LLM APIs
-    "together>=1.5.34",
-    "groq>=1.0.0",
     "anthropic>=0.72.0",
     "openai>=2.7.1",
     # Training framework
     "tinker>=0.9.0",
+    "chz",
     # Utilities
     "wandb>=0.22.1",
     "rank-bm25>=0.2.2",
@@ -29,6 +28,8 @@ dependencies = [
     "gdown>=5.2.0",
     "tiktoken>=0.12.0",
     "tqdm",
+    "termcolor",
+    "python-dotenv",
     "jupyter>=1.1.1",
 ]
 
@@ -38,6 +39,9 @@ dev = [
     "pytest-asyncio",
     "ruff",
 ]
+verieql = [
+    "verieql",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -45,3 +49,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["tinker_cookbook"]
+
+[tool.uv.sources]
+# VeriEQL is a public bounded SQL-equivalence checker used by the training reward.
+# For double-blind review this points at an anonymized mirror; replace ANON-MIRROR
+# with the public repository URL for the camera-ready release.
+verieql = { git = "https://github.com/ANON-MIRROR/VeriEQL.git" }

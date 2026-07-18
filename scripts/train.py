@@ -51,6 +51,10 @@ class CLIConfig:
     tau_neg: float = 0.1
     lora_rank: int = 32
     sql_engine: Literal["SQLite", "Snowflake"] = "SQLite"
+    # Reward configuration (default ON). Requires `uv run --extra verieql`.
+    use_verieql: bool = True
+    use_evidence_supervision_prompt: bool = True
+    use_evidence_supervision_penalty: bool = True
 
 def build_config(cli_config: CLIConfig) -> train.Config:
     model_name = cli_config.model_name
@@ -61,7 +65,7 @@ def build_config(cli_config: CLIConfig) -> train.Config:
     if cli_config.log_path is not None:
         log_path = cli_config.log_path
     else:
-        log_path = f"/mydata/tinker/{run_name}"
+        log_path = f"./outputs/tinker/{run_name}"
 
     if cli_config.wandb_name is not None:
         wandb_name = cli_config.wandb_name
@@ -90,6 +94,9 @@ def build_config(cli_config: CLIConfig) -> train.Config:
         max_turns=cli_config.max_turns,
         max_input_tokens=cli_config.max_input_tokens,
         sql_engine=cli_config.sql_engine,
+        use_verieql=cli_config.use_verieql,
+        use_evidence_supervision_prompt=cli_config.use_evidence_supervision_prompt,
+        use_evidence_supervision_penalty=cli_config.use_evidence_supervision_penalty,
     )
 
     return train.Config(
