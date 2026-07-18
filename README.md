@@ -1,21 +1,19 @@
-# ReViSQL: Achieving Human-Level Text-to-SQL
+# ReViSQL: Human-Level Text-to-SQL via Reinforcement Learning on Verified Data, Without Pipeline Engineering
 
 **SIGMOD 2027 Artifact**
 
-> ReViSQL achieves human-level accuracy on BIRD for the first time without any multi-stage pipeline. It fine-tunes an LLM with reinforcement learning with verifiable rewards (RLVR) on BIRD-Platinum — a dataset of 2,462 expert-verified Text-to-SQL instances — and reaches human parity with inference-time scaling via majority voting.
+> ReViSQL achieves human-level accuracy on BIRD for the first time without any multi-stage pipeline. It fine-tunes an LLM with reinforcement learning with verifiable rewards (RLVR) on BIRD-Platinum — a dataset of 2,462 expert-verified Text-to-SQL instances.
 
 
 ## Framework Overview
 
-ReViSQL reaches human parity through three procedures:
+ReViSQL reaches human parity through two procedures:
 
 1. **BIRD-Platinum** — Expert-curated training data. We corrected annotation errors across 52.1% of SQL queries, 26.2% of questions, and 18.2% of external knowledge entries in 2,462 instances sampled from BIRD Train.
 
 2. **RLVR Training** — Fine-tuning with CISPO. We train two configurations:
    - **ReViSQL** (the recipe): RLVR on BIRD-Platinum with a result-based reward that grades a rollout by whether its execution result matches the verified gold. We fine-tune Qwen3-235B-A22B with this recipe (**ReViSQL-235B**).
    - **ReViSQL-BIRD** (BIRD-specialized): adds two reward-shaping techniques to the result-based reward — a **VeriEQL** formal-equivalence check that softly down-weights rollouts whose results match by coincidence but are not provably equivalent to the gold, and an **evidence-supervision** reward that requires the model to translate and verify each external-knowledge entry. We fine-tune Kimi-K2.6 with this variant (**ReViSQL-BIRD-K2.6**), the model that reaches human parity. No process reward model (PRM) is used.
-
-3. **Inference-time Scaling** — At inference, the fine-tuned model generates *N* candidate queries per question, and the final answer is selected by execution-based majority voting.
 
 
 ## Repository Structure
